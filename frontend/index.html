@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order Tracker - Customer</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="config.js"></script>
+</head>
+<body>
+<header>
+  <h1>Order Tracker</h1>
+  <nav><a href="index.html" class="active">Customer</a><a href="agent.html">Support agent</a></nav>
+  <div id="status">Connecting…</div>
+</header>
+
+<main>
+  <section>
+    <h2>Menu (REST: /api/v1/catalog)</h2>
+    <div class="row"><input type="text" id="customer" placeholder="Your name"></div>
+    <div id="catalog"></div>
+    <div class="row" style="margin-top:10px"><button id="placeOrder">Place order</button></div>
+  </section>
+
+  <section>
+    <h2>My orders (live updates via WebSocket)</h2>
+    <div id="orders"><span class="empty">No orders yet. Place one from the menu.</span></div>
+  </section>
+
+  <section>
+    <h2>Chat with support (Socket.io)</h2>
+    <div class="log" id="chat"></div>
+    <div class="typing" id="typing"></div>
+    <div class="row"><input type="text" id="chatText" placeholder="Type a message"><button id="sendBtn">Send</button></div>
+  </section>
+
+  <section>
+    <h2>Live alerts (SSE: /events)</h2>
+    <div class="log" id="alerts"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const money = n => "Rs. " + n;
+let orders = [], myName = localStorage.getItem("customerName") || "";
+$("customer").value = myName;
+
+// ---------- REST ----------
+async function loadCatalog() {
+  const catalog = await (await fetch(API + "/api/v1/catalog")).json();
+  $("catalog").innerHTML = catalog.map(c => `
+    <div class="catalog-item"><span>${c.name} — ${money(c.price)}</span>
+    <input type="number" min="0" value="0" data-id="${c.id}" aria-label="Quantity for ${c.name}"></div>`).join("");
+}
+async function loadOrders() { orders = await (await fetch(API + "/api/v1/orders")).json(); renderOrders(); }
+
+$("placeOrder").onclick = async () => {
+  const name = $("customer").value.trim();
+  if (!name) return alert("Enter your name first.");
+  const items = [...document.querySelectorAll("#catalog input")].filter(i => +i.value > 0).map(i => ({ id: +i.dataset.id, qty: +i.value }));
+  if (!items.length) return alert("Select at least one item.");
+  setName(name);
+  const res = await fetch(API + "/api/v1/orders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ customer: name, items }) });
+  if (!res.ok) alert((await res.json()).error);
+  document.querySelectorAll("#catalog input").forEach(i => i.value = 0);
+};
+
+function renderOrders() {
+  const mine = orders.filter(o => o.customer.toLowerCase() === myName.toLowerCase());
+  if (!mine.length) { $("orders").innerHTML = '<span class="empty">No orders yet. Place one from the menu.</span>'; return; }
+  $("orders").innerHTML = mine.slice().reverse().map(o => `
+    <div class="order">
+      <div class="top"><strong>#${o.id}</strong><span class="badge ${o.status.replace(/ /g, "")}">${o.status}</span></div>
+      <div>${o.items.map(i => `${i.qty}× ${i.name}`).join(", ")} — ${money(o.total)}</div>
+      <div class="actions"><button class="danger" ${["Delivered", "Cancelled"].includes(o.status) ? "disabled" : ""} onclick="cancelOrder(${o.id})">Cancel order</button></div>
+    </div>`).join("");
+}
+
+// ---------- JSON-RPC ----------
+window.cancelOrder = async id => {
+  const res = await fetch(API + "/rpc", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", method: "cancelOrder", params: { id }, id: Date.now() }) });
+  const data = await res.json();
+  if (data.error) alert(data.error.message);
+};
+
+// ---------- WebSocket ----------
+const socket = io(API);
+socket.on("connect", () => { $("status").textContent = "Connected (WebSocket)"; if (myName) joinChat(); });
+socket.on("disconnect", () => $("status").textContent = "Disconnected");
+socket.on("order:new", o => { orders.push(o); renderOrders(); });
+socket.on("order:status", ({ id, status }) => { const o = orders.find(x => x.id === id); if (o) { o.status = status; renderOrders(); } });
+
+function setName(name) {
+  if (name === myName) return;
+  myName = name; localStorage.setItem("customerName", name);
+  renderOrders(); joinChat();
+}
+function joinChat() { if (myName) socket.emit("join", { name: myName, role: "customer", room: myName }); }
+$("customer").addEventListener("change", e => { if (e.target.value.trim()) setName(e.target.value.trim()); });
+
+const addChat = (html, cls = "") => { const d = document.createElement("div"); d.className = cls; d.innerHTML = html; $("chat").appendChild(d); $("chat").scrollTop = 1e9; };
+function send() {
+  const t = $("chatText").value.trim();
+  if (!t) return;
+  if (!myName) return alert("Enter your name in the menu section first.");
+  socket.emit("chat:message", { room: myName, text: t }); $("chatText").value = "";
+}
+$("sendBtn").onclick = send;
+$("chatText").addEventListener("keydown", e => { if (e.key === "Enter") send(); else if (myName) socket.emit("chat:typing", { room: myName }); });
+socket.on("chat:message", m => addChat(`<span class="who">${m.from}:</span> ${m.text.replace(/</g, "&lt;")}`, "msg " + m.role));
+socket.on("chat:system", t => addChat(`<em>${t}</em>`));
+let tt; socket.on("chat:typing", n => { $("typing").textContent = n + " is typing…"; clearTimeout(tt); tt = setTimeout(() => $("typing").textContent = "", 1200); });
+
+// ---------- SSE ----------
+const es = new EventSource(API + "/events");
+es.addEventListener("alert", e => {
+  const a = JSON.parse(e.data), d = document.createElement("div");
+  d.className = a.type; d.textContent = `[${new Date(a.time).toLocaleTimeString()}] ${a.message}`;
+  $("alerts").appendChild(d); $("alerts").scrollTop = 1e9;
+});
+
+loadCatalog(); loadOrders();
+</script>
+</body>
+</html>

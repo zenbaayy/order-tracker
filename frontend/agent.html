@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order Tracker - Support Agent</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="config.js"></script>
+</head>
+<body>
+<header>
+  <h1>Support Agent Console</h1>
+  <nav><a href="index.html">Customer</a><a href="agent.html" class="active">Support agent</a></nav>
+  <div id="status">Connecting…</div>
+</header>
+
+<main>
+  <section>
+    <h2>Customer chats (Socket.io)</h2>
+    <div class="row"><input type="text" id="agentName" placeholder="Agent name" value="Agent Ali"></div>
+    <div class="rooms" id="rooms"><span class="empty">No customers online yet.</span></div>
+    <div class="log" id="chat"></div>
+    <div class="typing" id="typing"></div>
+    <div class="row"><input type="text" id="chatText" placeholder="Select a customer, then type a reply" disabled><button id="sendBtn" disabled>Send</button></div>
+  </section>
+
+  <section>
+    <h2>All orders (REST + WebSocket)</h2>
+    <div id="orders"><span class="empty">No orders yet.</span></div>
+  </section>
+
+  <section>
+    <h2>Live alerts (SSE: /events)</h2>
+    <div class="log" id="alerts"></div>
+  </section>
+
+  <section>
+    <h2>JSON-RPC 2.0 console (/rpc)</h2>
+    <div class="row">
+      <input type="text" id="rpcId" placeholder="Order ID" style="width:100px">
+      <select id="rpcMethod"><option>cancelOrder</option><option>getOrderStatus</option><option>advanceOrder</option></select>
+      <button id="rpcBtn" class="ghost">Call</button>
+    </div>
+    <pre id="rpcOut">Response will appear here</pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const money = n => "Rs. " + n;
+let orders = [], currentRoom = null, joinedRooms = new Set();
+
+// ---------- REST ----------
+async function loadOrders() { orders = await (await fetch(API + "/api/v1/orders")).json(); renderOrders(); }
+function renderOrders() {
+  if (!orders.length) return;
+  $("orders").innerHTML = orders.slice().reverse().map(o => `
+    <div class="order">
+      <div class="top"><strong>#${o.id} · ${o.customer}</strong><span class="badge ${o.status.replace(/ /g, "")}">${o.status}</span></div>
+      <div>${o.items.map(i => `${i.qty}× ${i.name}`).join(", ")} — ${money(o.total)}</div>
+      <div class="actions">
+        <button class="ghost" onclick="setStatus(${o.id},'Preparing')">Preparing</button>
+        <button class="ghost" onclick="setStatus(${o.id},'Out for Delivery')">Out for delivery</button>
+        <button class="ghost" onclick="setStatus(${o.id},'Delivered')">Delivered</button>
+      </div>
+    </div>`).join("");
+}
+window.setStatus = (id, status) => fetch(API + `/api/v1/orders/${id}/status`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) });
+
+// ---------- WebSocket ----------
+const socket = io(API);
+socket.on("connect", () => { $("status").textContent = "Connected (WebSocket)"; joinedRooms.clear(); socket.emit("chat:rooms"); if (currentRoom) openRoom(currentRoom); });
+socket.on("disconnect", () => $("status").textContent = "Disconnected");
+socket.on("order:new", o => { orders.push(o); renderOrders(); });
+socket.on("order:status", ({ id, status }) => { const o = orders.find(x => x.id === id); if (o) { o.status = status; renderOrders(); } });
+
+let knownRooms = [];
+socket.on("chat:rooms", list => { knownRooms = list; renderRooms(); });
+function renderRooms() {
+  $("rooms").innerHTML = knownRooms.length
+    ? knownRooms.map(r => `<button class="${r === currentRoom ? "on" : ""}" onclick="openRoom('${r.replace(/'/g, "\\'")}')">${r}</button>`).join("")
+    : '<span class="empty">No customers online yet.</span>';
+}
+
+const addChat = (html, cls = "") => { const d = document.createElement("div"); d.className = cls; d.innerHTML = html; $("chat").appendChild(d); $("chat").scrollTop = 1e9; };
+window.openRoom = room => {
+  currentRoom = room;
+  $("chat").innerHTML = "";
+  socket.emit("join", { name: $("agentName").value.trim() || "Agent", role: "agent", room });
+  $("chatText").disabled = $("sendBtn").disabled = false;
+  $("chatText").placeholder = "Reply to " + room;
+  renderRooms();
+};
+function send() { const t = $("chatText").value.trim(); if (!t || !currentRoom) return; socket.emit("chat:message", { room: currentRoom, text: t }); $("chatText").value = ""; }
+$("sendBtn").onclick = send;
+$("chatText").addEventListener("keydown", e => { if (e.key === "Enter") send(); else if (currentRoom) socket.emit("chat:typing", { room: currentRoom }); });
+socket.on("chat:message", m => addChat(`<span class="who">${m.from}:</span> ${m.text.replace(/</g, "&lt;")}`, "msg " + m.role));
+socket.on("chat:system", t => addChat(`<em>${t}</em>`));
+let tt; socket.on("chat:typing", n => { $("typing").textContent = n + " is typing…"; clearTimeout(tt); tt = setTimeout(() => $("typing").textContent = "", 1200); });
+
+// ---------- SSE ----------
+const es = new EventSource(API + "/events");
+es.addEventListener("alert", e => {
+  const a = JSON.parse(e.data), d = document.createElement("div");
+  d.className = a.type; d.textContent = `[${new Date(a.time).toLocaleTimeString()}] ${a.message}`;
+  $("alerts").appendChild(d); $("alerts").scrollTop = 1e9;
+});
+
+// ---------- JSON-RPC ----------
+$("rpcBtn").onclick = async () => {
+  const id = parseInt($("rpcId").value.replace(/\D/g, ""));
+  const res = await fetch(API + "/rpc", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", method: $("rpcMethod").value, params: { id }, id: Date.now() }) });
+  $("rpcOut").textContent = JSON.stringify(await res.json(), null, 2);
+};
+
+loadOrders();
+</script>
+</body>
+</html>
